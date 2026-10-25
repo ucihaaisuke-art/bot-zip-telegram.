@@ -1,5 +1,6 @@
 import asyncio
 import io
+import logging
 import os
 import re
 import tempfile
@@ -8,10 +9,28 @@ from pathlib import Path
 
 from PIL import Image, ImageOps
 from telegram import InputMediaPhoto
+from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TelegramError
 from telegram.ext import Application, CommandHandler
 
 Image.MAX_IMAGE_PIXELS = 25_000_000
 busy = set()
+logger = logging.getLogger(__name__)
+MAX_RATE_LIMIT_RETRIES = 5
+
+
+async def telegram_call(method, **kwargs):
+    """Retry only explicit flood-limit rejections, never uncertain deliveries."""
+    for attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
+        try:
+            return await method(**kwargs)
+        except RetryAfter as error:
+            if attempt == MAX_RATE_LIMIT_RETRIES:
+                raise
+            delay = error.retry_after
+            if hasattr(delay, "total_seconds"):
+                delay = delay.total_seconds()
+            logger.warning("Telegram membatasi pengiriman; menunggu %.1f detik", delay + 1)
+            await asyncio.sleep(delay + 1)
 
 
 def prepare(path):
@@ -50,8 +69,9 @@ def prepare(path):
 
 
 async def start(update, context):
-    await update.effective_message.reply_text(
-        "Kirim ZIP berisi JPG/JPEG, lalu balas ZIP dengan "
+    await telegram_call(
+        update.effective_message.reply_text,
+        text="Kirim ZIP berisi JPG/JPEG, lalu balas ZIP dengan "
         "/proses atau /proses@username_bot. Maksimal ZIP 20 MB."
     )
 
@@ -61,30 +81,37 @@ async def process(update, context):
     source = message.reply_to_message
 
     if not source or not source.document:
-        await message.reply_text("Balas pesan ZIP dengan /proses.")
+        await telegram_call(message.reply_text, text="Balas pesan ZIP dengan /proses.")
         return
 
     document = source.document
     if not (document.file_name or "").lower().endswith(".zip"):
-        await message.reply_text("File harus berformat ZIP.")
+        await telegram_call(message.reply_text, text="File harus berformat ZIP.")
         return
     if (document.file_size or 0) > 20 * 1024**2:
-        await message.reply_text("Ukuran ZIP maksimal 20 MB.")
+        await telegram_call(message.reply_text, text="Ukuran ZIP maksimal 20 MB.")
         return
     if message.chat_id in busy:
-        await message.reply_text("Tunggu, ZIP sebelumnya masih diproses.")
+        await telegram_call(message.reply_text, text="Tunggu, ZIP sebelumnya masih diproses.")
         return
 
     busy.add(message.chat_id)
     sent = 0
+    phase = "download"
     try:
-        await message.reply_text("Sedang menyiapkan foto…")
+        await telegram_call(
+            message.reply_text,
+            text="Sedang menyiapkan foto… Pengiriman di grup bisa lebih lama "
+                 "karena batas Telegram; bot akan menunggu otomatis jika dibatasi.",
+        )
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "input.zip"
-            remote = await document.get_file()
+            remote = await telegram_call(document.get_file)
             await remote.download_to_drive(path)
+            phase = "prepare"
             photos = await asyncio.to_thread(prepare, path)
 
+        phase = "send"
         title = Path(document.file_name).stem[:200]
         total = (len(photos) + 9) // 10
         for offset in range(0, len(photos), 10):
@@ -97,7 +124,8 @@ async def process(update, context):
                 "message_thread_id": message.message_thread_id,
             }
             if len(batch) == 1:
-                await context.bot.send_photo(
+                await telegram_call(
+                    context.bot.send_photo,
                     photo=batch[0], caption=caption, **options
                 )
             else:
@@ -107,18 +135,48 @@ async def process(update, context):
                     )
                     for index, photo in enumerate(batch)
                 ]
-                await context.bot.send_media_group(media=media, **options)
+                await telegram_call(context.bot.send_media_group, media=media, **options)
             sent += len(batch)
-            await asyncio.sleep(1)
+            # Albums contain multiple messages; groups have tighter flood limits.
+            is_group = message.chat.type in ("group", "supergroup")
+            await asyncio.sleep(len(batch) * 3.5 if is_group else 1)
 
-        await message.reply_text(f"Selesai! {sent} foto terkirim.")
-    except Exception:
-        await message.reply_text(
-            f"Proses gagal setelah {sent} foto terkirim. "
-            "Pastikan ZIP tidak berpassword, berisi JPG valid, "
-            "maksimal 200 gambar/200 MB setelah dibuka, dan bot "
-            "boleh mengirim foto. Jika diulang, proses mulai dari awal."
+        await telegram_call(message.reply_text, text=f"Selesai! {sent} foto terkirim.")
+    except Exception as error:
+        # Do not log raw exceptions: network errors can contain a bot-token URL.
+        logger.error(
+            "Proses ZIP terhenti: tahap=%s foto_terkonfirmasi=%d jenis=%s",
+            phase, sent, type(error).__name__,
         )
+        if isinstance(error, RetryAfter):
+            reason = "Telegram masih membatasi pengiriman setelah beberapa percobaan. Coba lagi nanti."
+        elif isinstance(error, Forbidden):
+            reason = "Telegram menolak akses bot. Periksa izin bot untuk mengirim foto di grup."
+        elif isinstance(error, BadRequest):
+            reason = "Telegram menolak permintaan. Periksa izin bot, foto, dan pengaturan grup."
+        elif isinstance(error, NetworkError):
+            reason = "Koneksi ke Telegram bermasalah atau melewati batas waktu."
+            if phase == "send":
+                reason += " Kiriman terakhir mungkin sudah diterima; periksa chat sebelum mengulang."
+        elif isinstance(error, TelegramError):
+            reason = "Telegram menolak permintaan. Periksa izin bot dan pengaturan grup."
+        elif phase == "prepare":
+            reason = (
+                "ZIP tidak dapat diproses. Pastikan tidak berpassword, berisi 1–200 JPG/JPEG valid, "
+                "maksimal 200 MB setelah dibuka, dan gambar tidak terlalu panjang."
+            )
+        elif phase == "download":
+            reason = "ZIP gagal diunduh dari Telegram. Coba kirim ulang file."
+        else:
+            reason = "Terjadi kesalahan saat menyiapkan pengiriman foto."
+        try:
+            await telegram_call(
+                message.reply_text,
+                text=f"Proses terhenti. {sent} foto terkonfirmasi terkirim. {reason} "
+                     "Jika /proses diulang, pengiriman mulai dari awal dan foto bisa terkirim dua kali.",
+            )
+        except TelegramError as notice_error:
+            logger.error("Pemberitahuan gagal dikirim: jenis=%s", type(notice_error).__name__)
     finally:
         busy.discard(message.chat_id)
 
