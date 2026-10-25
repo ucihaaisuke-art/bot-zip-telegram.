@@ -187,9 +187,9 @@ async def process(update, context):
 
             sent += len(batch)
 
-            # Jeda singkat hanya di antara album.
-            # Jika Telegram membatasi, telegram_call menangani RetryAfter.
-                        is_group = message.chat.type in ("group", "supergroup")
+            # Jeda grup: 3,5 detik per foto, atau 35 detik per 10 foto.
+            # Japri tetap menggunakan jeda 1 detik.
+            is_group = message.chat.type in ("group", "supergroup")
             await asyncio.sleep(len(batch) * 3.5 if is_group else 1)
 
         await telegram_call(
