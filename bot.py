@@ -28,12 +28,14 @@ PROCESSING_TEXT = os.environ.get(
     "Gambarnya lagi proses ya tuan/putri ,\n"
     'mohon ditunggu dengan sabar " kalo ga sabar buat sendiri aja',
 )
+
 SUCCESS_TEXT = os.environ.get(
     "SUCCESS_TEXT",
     "GAMBAR DONE YA BAPAK/IBU JOKERPLAY!!",
 )
 
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp")
+TARGET_FOLDERS = {"jp", "joker"}
 RAR_SIGNATURES = (
     b"Rar!\x1a\x07\x00",
     b"Rar!\x1a\x07\x01\x00",
@@ -225,11 +227,35 @@ class RarReader:
 
 
 def is_image(name):
-    name = name.replace("\\", "/")
-    return (
-        not name.startswith("__MACOSX/")
-        and name.lower().endswith(IMAGE_EXTENSIONS)
+    parts = []
+
+    for part in name.replace("\\", "/").split("/"):
+        if part in ("", "."):
+            continue
+
+        if part == "..":
+            if not parts:
+                return False
+            parts.pop()
+        else:
+            parts.append(part)
+
+    if not parts:
+        return False
+
+    if any(part.casefold() == "__macosx" for part in parts):
+        return False
+
+    valid_extension = parts[-1].casefold().endswith(
+        IMAGE_EXTENSIONS
     )
+
+    target_folder = any(
+        part.strip().casefold() in TARGET_FOLDERS
+        for part in parts[:-1]
+    )
+
+    return valid_extension and target_folder
 
 
 def records(path):
@@ -263,6 +289,7 @@ def records(path):
         raise ArchiveError("File bukan ZIP atau RAR yang valid.")
 
     archive = RarReader(path)
+
     try:
         for name, size, source in archive.entries():
             if is_image(name):
@@ -272,7 +299,6 @@ def records(path):
 
 
 async def telegram_call(method, **kwargs):
-    """Ulangi hanya penolakan rate limit yang sudah pasti."""
     for attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
         try:
             return await method(**kwargs)
@@ -292,13 +318,13 @@ async def telegram_call(method, **kwargs):
 
 
 def prepare(path, folder, stats):
-    """Baca gambar bertahap, maksimal satu album dalam penampung."""
     stats["total"] = sum(1 for _ in records(path))
     stats["skipped"] = 0
 
     if not stats["total"]:
-        raise ValueError(
-            "Arsip tidak berisi JPG, JPEG, PNG, atau WEBP."
+        raise ArchiveError(
+            "Tidak ditemukan gambar JPG/JPEG, PNG, atau WEBP "
+            "di dalam folder JP/JOKER pada arsip ini."
         )
 
     batch = []
@@ -381,9 +407,11 @@ async def start(update, context):
     await telegram_call(
         update.effective_message.reply_text,
         text=(
-            "Kirim ZIP atau RAR berisi JPG/JPEG, PNG, atau WEBP, "
-            "lalu balas arsip dengan /proses atau "
-            "/proses@username_bot. Jumlah foto tidak dibatasi. "
+            "Kirim ZIP atau RAR, lalu balas arsip dengan "
+            "/proses atau /proses@username_bot. "
+            "Bot hanya mengambil gambar JPG/JPEG, PNG, atau WEBP "
+            "di dalam folder JP atau JOKER beserta subfoldernya. "
+            "Jumlah foto tidak dibatasi. "
             + mode_text
         ),
     )
@@ -495,6 +523,7 @@ async def process(update, context):
                         f"{Path(document.file_name).stem[:200]}\n"
                         f"Bagian {part}/{total}"
                     )
+
                     options = {
                         "chat_id": message.chat_id,
                         "message_thread_id": message.message_thread_id,
@@ -524,6 +553,7 @@ async def process(update, context):
                         del media
 
                     sent += len(batch)
+
                     is_group = message.chat.type in (
                         "group", "supergroup"
                     )
@@ -590,11 +620,13 @@ async def process(update, context):
                 "Koneksi ke Telegram bermasalah "
                 "atau melewati batas waktu."
             )
+
             if phase == "send":
                 reason += (
                     " Kiriman terakhir mungkin sudah diterima; "
                     "periksa chat sebelum mengulang."
                 )
+
         elif isinstance(error, TelegramError):
             reason = (
                 "Telegram menolak permintaan. "
